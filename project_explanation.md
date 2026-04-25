@@ -1,9 +1,7 @@
-# 🔬 Forensic Entity-Action Profiler (FEAP) - Detailed Explanation
-
-Here is a comprehensive, deep-dive explanation of your project, the **Forensic Entity-Action Profiler (FEAP)**, broken down by its architecture, libraries, and function-by-function behaviors.
+# 🔬 Forensic Entity-Action Profiler (FEAP)
 
 ## 1. Project Overview
-**FEAP** is an advanced, Object-Oriented Natural Language Processing (NLP) dashboard built to decode weaponized language and "logistical ciphers" (hidden meanings). Specifically tailored for the Epstein email corpus, it uses the "Lemalock Hypothesis" to analyze pragmatics—finding out if seemingly innocent words (like *pizza* or *massage*) are actually functioning as coded terms for illicit logistics. 
+**FEAP** is an advanced, Object-Oriented Natural Language Processing (NLP) dashboard built to decode weaponized language and "logistical ciphers" (hidden meanings). Specifically tailored for the Epstein email corpus, it analyzes pragmatics finding out if seemingly innocent words (like *pizza* or *massage*) are actually functioning as coded terms for illicit logistics. 
 
 It does this through syntactic dependency parsing, entity graph mappings, topic modeling, time-series analysis, and zero-shot threat classification.
 
