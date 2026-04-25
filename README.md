@@ -56,5 +56,5 @@ The application is structured into five core analytical modules:
 - `.streamlit/config.toml`: Custom configuration to resolve PyTorch/Streamlit watcher conflicts.
 
 ---
-**Author**: Ameen K.P | EFLU  
+**Author**: Ameen K.P | EFLU  Hyderabad
 
