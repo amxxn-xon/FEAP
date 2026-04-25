@@ -1,0 +1,7 @@
+[server]
+# Disabling the file watcher entirely to prevent RuntimeError with Torch/Streamlit introspection
+fileWatcherType = "none"
+
+[theme]
+base="light"
+primaryColor="#63b3ed"
