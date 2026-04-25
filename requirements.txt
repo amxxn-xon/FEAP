@@ -23,8 +23,8 @@ gensim>=4.3.0
 
 # ── Deep Learning / Zero-Shot (Module 5 - Threat Assessor) ────────────────────
 # Pinning specific weights and torch version for stability
-torch==2.5.1
-torchvision==0.20.1
+torch
+torchvision
 transformers>=4.41.0
-protobuf==3.20.3
+protobuf>=3.20.3
 huggingface-hub>=0.23.0
