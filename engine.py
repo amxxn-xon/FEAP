@@ -5,19 +5,22 @@ Core OOP engine: CorpusProcessor base class + 5 analytical subclasses.
 Lemalock Hypothesis — Computational Pragmatics Framework
 Author: Ameen K.P | EFLU
 
-IMPROVEMENTS:
-- AI-powered dynamic wordlist expansion (replaces static dictionaries)
-- AI-powered LDA topic interpretation
-- Larger email batch support
-- Node click data returned for spiderweb overlay
-- Email lookup by ID for overlays
+Design notes:
+- Heavy models (spaCy, the zero-shot transformer) are loaded once per process
+  and shared by every module.
+- Keyword matching is whole-word by default (with simple inflections), so
+  "pie" no longer matches "piece" and "may" no longer matches "mayor".
+- Every module degrades gracefully when its optional dependency is missing.
 """
 
 import json
-import re
 import os
-from collections import defaultdict, Counter
-from typing import List, Dict, Any, Counter as TypingCounter
+import re
+import threading
+import time
+from collections import Counter, defaultdict
+from datetime import date
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 # ── Optional heavy imports (graceful fallback) ───────────────────────────────
 try:
@@ -25,27 +28,6 @@ try:
     _SPACY_AVAILABLE = True
 except ImportError:
     _SPACY_AVAILABLE = False
-
-try:
-    import nltk  # type: ignore
-    from nltk import ne_chunk, pos_tag as nltk_pos_tag, word_tokenize
-    from nltk.tree import Tree  # type: ignore
-    _NLTK_AVAILABLE = True
-
-    # ── Cloud Readiness: Automatic NLTK Download ──────────────────────────────
-    def _setup_nltk():
-        for res in ['punkt', 'words', 'maxent_ne_chunker', 'averaged_perceptron_tagger']:
-            try:
-                nltk.data.find(res)
-            except LookupError:
-                nltk.download(res, quiet=True)
-            except Exception:
-                pass # Fallback for unexpected path issues
-
-    _setup_nltk()
-
-except ImportError:
-    _NLTK_AVAILABLE = False
 
 try:
     import networkx as nx  # type: ignore
@@ -61,28 +43,25 @@ except ImportError:
 
 try:
     from gensim import corpora  # type: ignore
-    from gensim.models import LdaModel
+    from gensim.models import LdaModel  # type: ignore
     from gensim.parsing.preprocessing import STOPWORDS as GENSIM_STOP  # type: ignore
     _GENSIM_AVAILABLE = True
 except ImportError:
+    GENSIM_STOP = frozenset()
     _GENSIM_AVAILABLE = False
-
-try:
-    import torch  # type: ignore
-    _TORCH_AVAILABLE = True
-except ImportError:
-    _TORCH_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-_BASE = os.path.dirname(__file__)
+_BASE = os.path.dirname(os.path.abspath(__file__))
 _CLEAN_PATH      = os.path.join(_BASE, "data", "epstein_clean_data.json")
 _ANNOTATED_PATH  = os.path.join(_BASE, "data", "epstein_annotated.json")
 
+SPACY_MODEL     = "en_core_web_sm"
+ZERO_SHOT_MODEL = "cross-encoder/nli-MiniLM2-L6-H768"
+
 # ─────────────────────────────────────────────────────────────────────────────
-# STATIC WORDLISTS (Fallback — used when AI expansion is unavailable)
-# These are kept as seeds; the AIWordlistExpander enriches them at runtime.
+# STATIC WORDLISTS (seeds — the AIWordlistExpander can enrich them at runtime)
 # ─────────────────────────────────────────────────────────────────────────────
 FOOD_CODE_WORDS = {
     'pizza', 'hotdog', 'hot dog', 'pasta', 'ice cream', 'cheese',
@@ -103,7 +82,7 @@ EUPHEMISM_WORDS = {
 HEDGE_WORDS = {
     'would', 'could', 'might', 'should', 'may', 'perhaps', 'possibly',
     'maybe', 'likely', 'probably', 'apparently', 'seemingly', 'sort of',
-    'kind of', 'I think', 'I believe', 'I suppose', 'presumably'
+    'kind of', 'i think', 'i believe', 'i suppose', 'presumably'
 }
 
 LOGISTIC_VERBS = {
@@ -112,20 +91,261 @@ LOGISTIC_VERBS = {
     'prepare', 'handle', 'manage', 'pick up', 'drop off', 'bring', 'provide'
 }
 
+# Words that carry no topical signal in this corpus: e-mail headers, client
+# boilerplate, dates and redaction markers. Used by LDA and word-frequency
+# fallbacks so topics describe content rather than e-mail plumbing.
+EMAIL_BOILERPLATE = {
+    'wrote', 'sent', 'iphone', 'ipad', 'blackberry', 'forwarded', 'forward',
+    'fwd', 'message', 'original', 'redacted', 'efta', 'subject', 'date',
+    'from', 'cc', 'bcc', 'reply', 'mailto', 'com', 'net', 'org', 'www',
+    'http', 'https', 'html', 'gmail', 'mail', 'email', 'emails', 'image',
+    'jpg', 'png', 'pdf', 'attachment', 'begin', 'edt', 'est', 'pdt', 'pst',
+    'gmt', 'cdt', 'utc', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun',
+    'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday',
+    'sunday', 'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept',
+    'oct', 'nov', 'dec', 'january', 'february', 'march', 'april', 'june',
+    'july', 'august', 'september', 'october', 'november', 'december',
+    'thanks', 'thank', 'regards', 'best', 'dear', 'hello', 'hi', 'please',
+    'jeffrey', 'epstein', 'jeff', 'information', 'contained', 'intended',
+    'recipient', 'confidential', 'privileged', 'unsubscribe',
+}
+
+_WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEXT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+# Simple inflectional endings accepted in whole-word mode:
+# model → models / modeling / modelled, massage → massages / massaged.
+_INFLECTION_SUFFIX = r"(?:s|es|d|ed|ing|er|ers|'s|’s)?"
+
+
+def keyword_pattern(keyword: str, whole_word: bool = True) -> "re.Pattern[str]":
+    """
+    Compile a case-insensitive pattern for `keyword`.
+
+    whole_word=True  → match the word (plus simple inflections) only, so
+                       "pie" does not match "piece".
+    whole_word=False → plain substring match (the original behaviour).
+    Multi-word keywords tolerate any run of whitespace between words.
+    """
+    parts = keyword.strip().split()
+    if not parts:
+        # Never-matching pattern for empty input.
+        return re.compile(r"(?!x)x")
+    body = r"\s+".join(re.escape(p) for p in parts)
+    if whole_word:
+        body = rf"(?<!\w){body}{_INFLECTION_SUFFIX}(?!\w)"
+    return re.compile(body, re.IGNORECASE)
+
+
+def _alternation(phrases: Iterable[str]) -> str:
+    # Longest first so multi-word phrases win over their prefixes.
+    escaped = sorted((r"\s+".join(map(re.escape, p.split())) for p in phrases),
+                     key=len, reverse=True)
+    return "|".join(escaped)
+
+
+_HEDGE_RE = re.compile(rf"(?<!\w)(?:{_alternation(HEDGE_WORDS)})(?!\w)", re.IGNORECASE)
+# "May" as a month: "May 5", "5 May", "in May", "of May 2014"…
+_MAY_MONTH_BEFORE = re.compile(r"(?:\d|\b(?:in|of|early|late|mid|since|until|by))[\s,-]*$", re.IGNORECASE)
+_MAY_MONTH_AFTER  = re.compile(r"^[\s,]*\d")
+
+
+def find_hedges(text: str) -> List[str]:
+    """Return every modal hedge in `text` (word-boundary aware, case-insensitive)."""
+    found = []
+    for m in _HEDGE_RE.finditer(text):
+        word = m.group(0)
+        if word == "May" and (
+            _MAY_MONTH_AFTER.match(text[m.end():m.end() + 6])
+            or _MAY_MONTH_BEFORE.search(text[max(0, m.start() - 12):m.start()])
+        ):
+            continue
+        found.append(word.lower())
+    return found
+
+
+def count_hedges(text: str) -> int:
+    return len(find_hedges(text))
+
+
+def has_hedge(text: str) -> bool:
+    return bool(find_hedges(text))
+
+
+# Irregular / doubled-consonant forms that the regular rules below miss.
+_IRREGULAR_FORMS = {
+    "send":     ["sent"],
+    "bring":    ["brought"],
+    "drop off": ["dropped off", "dropping off"],
+    "pick up":  ["picked up", "picking up", "picks up"],
+}
+
+
+def _verb_forms(verb: str) -> List[str]:
+    head, *rest = verb.split()
+    tail = (" " + " ".join(rest)) if rest else ""
+    if head.endswith("e"):
+        stem = head[:-1]
+        forms = [head, head + "s", head + "d", stem + "ing"]
+    else:
+        forms = [head, head + "s", head + "ed", head + "ing"]
+    forms = [f + tail for f in forms]
+    return forms + _IRREGULAR_FORMS.get(verb, [])
+
+
+_LOGISTIC_RE = re.compile(
+    rf"(?<!\w)(?:{_alternation(f for v in LOGISTIC_VERBS for f in _verb_forms(v))})(?!\w)",
+    re.IGNORECASE,
+)
+
+
+def count_logistic_verbs(text: str) -> int:
+    """Count logistic verbs in any regular/irregular inflection (arranged, sent…)."""
+    return len(_LOGISTIC_RE.findall(text))
+
+
+def tokenize_words(text: str) -> List[str]:
+    return _WORD_RE.findall(text.lower())
+
+
+# ── Date recovery ────────────────────────────────────────────────────────────
+# The corpus has no date field, but forwarded headers and reply lines carry
+# dates ("On Apr 6, 2016, at 3:04 PM … wrote", "Date: Thu, 07 Jan 2016").
+_MON = (r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|"
+        r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)")
+_YEAR = r"((?:19|20)\d\d)"
+_DATE_PATTERNS = [
+    # Apr 6, 2016 · July 2. 2013 · September 8th 2013
+    (re.compile(rf"\b{_MON}\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?[.,]?\s+{_YEAR}\b"), ("m", "d", "y")),
+    # 07 Jan 2016 · 7 January, 2016
+    (re.compile(rf"\b(\d{{1,2}})\s+{_MON}\.?,?\s+{_YEAR}\b"), ("d", "m", "y")),
+    # Fri Nov 12 14:40:17 2010
+    (re.compile(rf"\b{_MON}\s+(\d{{1,2}})\s+\d{{1,2}}:\d{{2}}(?::\d{{2}})?\s+{_YEAR}\b"), ("m", "d", "y")),
+    # 2009/5/4 · 2009-05-04
+    (re.compile(rf"\b{_YEAR}[/-](\d{{1,2}})[/-](\d{{1,2}})\b"), ("y", "m", "d")),
+    # 3/30/2018 (US order)
+    (re.compile(rf"\b(\d{{1,2}})/(\d{{1,2}})/{_YEAR}\b"), ("m", "d", "y")),
+]
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+def extract_dates(text: str) -> List[date]:
+    """Every plausible calendar date mentioned in `text`."""
+    found = []
+    for pattern, order in _DATE_PATTERNS:
+        for m in pattern.finditer(text):
+            parts = dict(zip(order, m.groups()))
+            month = parts["m"]
+            month = _MONTHS[month[:3].lower()] if not month.isdigit() else int(month)
+            try:
+                d = date(int(parts["y"]), month, int(parts["d"]))
+            except ValueError:
+                continue
+            if 1990 <= d.year <= date.today().year:
+                found.append(d)
+    return found
+
+
+def estimate_email_date(text: str) -> Optional[date]:
+    """
+    Best-effort send date: the most recent date mentioned. Quoted replies and
+    forwarded headers are older than the message that contains them.
+    """
+    dates = extract_dates(text)
+    return max(dates) if dates else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED MODEL LOADERS (one instance per process, thread-safe)
+# ─────────────────────────────────────────────────────────────────────────────
+_MODEL_LOCK = threading.Lock()
+_NLP = None
+_ZS_PIPELINE = None
+# (message, timestamp) of the last failed pipeline load. Loading can hang on
+# network retries when the model hub is unreachable, so failures are
+# remembered briefly instead of being retried on every call.
+_ZS_ERROR: Optional[tuple] = None
+_ZS_RETRY_AFTER = 300  # seconds
+
+
+def get_spacy_nlp():
+    """Load the spaCy English model once and share it across modules."""
+    global _NLP
+    if _NLP is None:
+        if not _SPACY_AVAILABLE:
+            raise RuntimeError(
+                "spaCy is not installed. Run: pip install spacy && "
+                f"python -m spacy download {SPACY_MODEL}"
+            )
+        with _MODEL_LOCK:
+            if _NLP is None:
+                try:
+                    _NLP = spacy.load(SPACY_MODEL)
+                except OSError:
+                    raise RuntimeError(
+                        f"spaCy model '{SPACY_MODEL}' is missing. Run: "
+                        f"python -m spacy download {SPACY_MODEL}"
+                    )
+    return _NLP
+
+
+def get_zero_shot_pipeline():
+    """
+    Load the zero-shot NLI pipeline once and share it across the threat
+    assessor, topic interpreter and wordlist expander (previously each loaded
+    its own copy of the same model).
+    """
+    global _ZS_PIPELINE, _ZS_ERROR
+    if _ZS_PIPELINE is None:
+        with _MODEL_LOCK:
+            if _ZS_PIPELINE is None:
+                if _ZS_ERROR and time.monotonic() - _ZS_ERROR[1] < _ZS_RETRY_AFTER:
+                    raise RuntimeError(_ZS_ERROR[0])
+                try:
+                    from transformers import pipeline  # type: ignore
+                    _ZS_PIPELINE = pipeline(
+                        "zero-shot-classification",
+                        model=ZERO_SHOT_MODEL,
+                        device=-1,
+                    )
+                except ImportError:
+                    msg = ("transformers or torch not installed. "
+                           "Run: pip install transformers torch")
+                    _ZS_ERROR = (msg, time.monotonic())
+                    raise RuntimeError(msg)
+                except Exception as e:
+                    msg = f"Error initializing NLP pipeline: {e}"
+                    _ZS_ERROR = (msg, time.monotonic())
+                    raise RuntimeError(msg)
+                _ZS_ERROR = None
+    return _ZS_PIPELINE
+
+
+def _zero_shot(texts: Sequence[str], labels: Sequence[str],
+               batch_size: int = 8) -> List[dict]:
+    """Run the shared pipeline on a batch and always return a list of results."""
+    pipe = get_zero_shot_pipeline()
+    out = pipe(list(texts), candidate_labels=list(labels),
+               multi_label=False, batch_size=batch_size)
+    return [out] if isinstance(out, dict) else list(out)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AI WORDLIST EXPANDER
-# Uses the HuggingFace zero-shot pipeline to dynamically score & expand
-# word membership in forensic categories — replaces hard-coded dictionaries.
+# Uses the zero-shot pipeline to score & expand word membership in forensic
+# categories on top of the static seed dictionaries.
 # ─────────────────────────────────────────────────────────────────────────────
 class AIWordlistExpander:
     """
-    Uses a zero-shot NLI model to dynamically decide whether corpus words
-    belong to forensic categories (food cipher, euphemism, logistical verb,
-    hedge). Much more accurate than static dictionaries.
+    Uses a zero-shot NLI model to decide whether frequent corpus words belong
+    to forensic categories (food cipher, euphemism, logistical verb, hedge).
+    Falls back to the static dictionaries when the model is unavailable.
     """
-    _pipeline = None
-    # Cache: word → {category: bool}
-    _cache = {}
+    # Cache: "word::category" → bool
+    _cache: Dict[str, bool] = {}
 
     CATEGORIES = {
         "food_code": "This word is used as a food-related code word or culinary euphemism in illicit communications",
@@ -133,109 +353,73 @@ class AIWordlistExpander:
         "logistic":  "This word describes a logistical coordination action like scheduling, transporting, or arranging",
         "hedge":     "This word is a modal hedge that reduces commitment or obscures intent in written communication",
     }
+    _NEUTRAL = "This word has no special significance"
 
-    @classmethod
-    def _get_pipeline(cls):
-        if cls._pipeline is None:
-            try:
-                from transformers import pipeline  # type: ignore
-                cls._pipeline = pipeline(
-                    "zero-shot-classification",
-                    model="cross-encoder/nli-MiniLM2-L6-H768",
-                    device=-1,
-                )
-            except Exception:
-                return None
-        return cls._pipeline
-
-    @classmethod
-    def is_member(cls, word: str, category: str, threshold: float = 0.65) -> bool:
-        """
-        Returns True if the AI model scores `word` as belonging to `category`
-        above the threshold. Falls back to static wordlists if model unavailable.
-        """
-        cache_key = f"{word}::{category}"
-        if cache_key in cls._cache:
-            return cls._cache[cache_key]
-
-        pipe = cls._get_pipeline()
-        if pipe is None:
-            # Graceful fallback to static lists
-            result = cls._static_fallback(word, category)
-            cls._cache[cache_key] = result
-            return result
-
-        label_text = cls.CATEGORIES.get(category, category)
-        try:
-            out = pipe(
-                f'The word "{word}" appears in an email.',
-                candidate_labels=[label_text, "This word has no special significance"],
-                multi_label=False,
-            )
-            score = out["scores"][0] if out["labels"][0] == label_text else out["scores"][1]
-            result = score >= threshold
-        except Exception:
-            result = cls._static_fallback(word, category)
-
-        cls._cache[cache_key] = result
-        return result
+    STATIC_BASES = {
+        "food_code": FOOD_CODE_WORDS,
+        "euphemism": EUPHEMISM_WORDS,
+        "logistic":  LOGISTIC_VERBS,
+        "hedge":     HEDGE_WORDS,
+    }
 
     @classmethod
     def _static_fallback(cls, word: str, category: str) -> bool:
-        w = word.lower()
-        if category == "food_code":   return w in FOOD_CODE_WORDS
-        if category == "euphemism":   return w in EUPHEMISM_WORDS
-        if category == "logistic":    return w in LOGISTIC_VERBS
-        if category == "hedge":       return w in HEDGE_WORDS
-        return False
+        return word.lower() in cls.STATIC_BASES.get(category, set())
+
+    @classmethod
+    def score_words(cls, words: Sequence[str], category: str,
+                    threshold: float = 0.65) -> Dict[str, bool]:
+        """Classify many words for one category in a single batched call."""
+        todo = [w for w in words if f"{w}::{category}" not in cls._cache]
+        if todo:
+            label_text = cls.CATEGORIES.get(category, category)
+            try:
+                outs = _zero_shot(
+                    [f'The word "{w}" appears in an email.' for w in todo],
+                    [label_text, cls._NEUTRAL],
+                )
+                for w, out in zip(todo, outs):
+                    score = dict(zip(out["labels"], out["scores"])).get(label_text, 0.0)
+                    cls._cache[f"{w}::{category}"] = score >= threshold
+            except Exception:
+                for w in todo:
+                    cls._cache[f"{w}::{category}"] = cls._static_fallback(w, category)
+        return {w: cls._cache[f"{w}::{category}"] for w in words}
+
+    @classmethod
+    def is_member(cls, word: str, category: str, threshold: float = 0.65) -> bool:
+        return cls.score_words([word], category, threshold)[word]
 
     @classmethod
     def expand_corpus_wordlist(cls, corpus_words: List[str], category: str,
                                top_n: int = 40) -> set:
         """
         Scan the most frequent corpus words and return those the AI classifies
-        as belonging to `category`. Merges with the static seed set.
+        as belonging to `category`, merged with the static seed set.
         """
-        static_bases = {
-            "food_code": set(FOOD_CODE_WORDS),
-            "euphemism": set(EUPHEMISM_WORDS),
-            "logistic":  set(LOGISTIC_VERBS),
-            "hedge":     set(HEDGE_WORDS),
-        }
-        base = static_bases.get(category, set())
-        dynamic = set()
-        for word in corpus_words[:top_n]:  # type: ignore
-            if word not in base and cls.is_member(word, category):
-                dynamic.add(word)
-        return base | dynamic
+        base = set(cls.STATIC_BASES.get(category, set()))
+        candidates = [w for w in corpus_words[:top_n] if w not in base]
+        scored = cls.score_words(candidates, category)
+        return base | {w for w, ok in scored.items() if ok}
 
     @classmethod
-    def get_dynamic_wordlists(cls, corpus) -> dict:
+    def get_dynamic_wordlists(cls, corpus, top_n: int = 40) -> dict:
         """
         Build all four dynamic wordlists from corpus vocabulary.
         Returns dict with keys: food_code, euphemism, logistic, hedge.
         """
-        # Collect top 80 frequent corpus words (excluding very common stop words)
-        stop = {'the','a','an','is','it','in','on','at','to','for','of','and',
-                'or','but','not','this','that','with','from','by','be','as',
-                'are','was','were','have','has','had','will','i','you','he',
-                'she','we','they','me','him','her','us','them','my','your'}
-        all_words = []
+        stop = set(GENSIM_STOP) | EMAIL_BOILERPLATE
+        counts: Counter = Counter()
         for e in corpus[:500]:
-            tokens = re.findall(r'\b[a-z]{3,}\b', e.get("body","").lower())
-            all_words.extend(t for t in tokens if t not in stop)
-        top_words = [w for w, _ in Counter(all_words).most_common(100)]
-
-        return {
-            "food_code": cls.expand_corpus_wordlist(top_words, "food_code"),
-            "euphemism": cls.expand_corpus_wordlist(top_words, "euphemism"),
-            "logistic":  cls.expand_corpus_wordlist(top_words, "logistic"),
-            "hedge":     cls.expand_corpus_wordlist(top_words, "hedge"),
-        }
+            counts.update(t for t in tokenize_words(e.get("body", ""))
+                          if len(t) >= 3 and t not in stop)
+        top_words = [w for w, _ in counts.most_common(100)]
+        return {cat: cls.expand_corpus_wordlist(top_words, cat, top_n=top_n)
+                for cat in cls.CATEGORIES}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AI TOPIC INTERPRETER
-# Calls HuggingFace to generate a human-readable description for each LDA topic
+# Matches LDA topic word clusters to forensic semantic categories.
 # ─────────────────────────────────────────────────────────────────────────────
 class AITopicInterpreter:
     """
@@ -243,7 +427,6 @@ class AITopicInterpreter:
     a set of forensic semantic categories, producing interpretable labels
     and descriptions.
     """
-    _pipeline = None
 
     FORENSIC_TOPIC_LABELS = [
         "Logistical coordination and travel planning",
@@ -258,104 +441,84 @@ class AITopicInterpreter:
         "Identity concealment and information suppression",
     ]
 
-    @classmethod
-    def _get_pipeline(cls):
-        if cls._pipeline is None:
-            try:
-                from transformers import pipeline  # type: ignore
-                cls._pipeline = pipeline(
-                    "zero-shot-classification",
-                    model="cross-encoder/nli-MiniLM2-L6-H768",
-                    device=-1,
-                )
-            except Exception:
-                return None
-        return cls._pipeline
+    _NOTES = {
+        "Logistical coordination and travel planning":
+            "🚨 High forensic relevance — coordinates movement of people/assets.",
+        "Social grooming and relationship management":
+            "🔴 Critical — language patterns consistent with grooming behaviour.",
+        "Financial transactions and payments":
+            "🔶 Significant — may indicate payment for services rendered covertly.",
+        "Coded food/service euphemisms for illicit activity":
+            "🟡 Cipher alert — food/service language as coded substitution.",
+        "Legal and administrative communication":
+            "🔵 Monitor — may contain suppression or legal-cover strategies.",
+        "Interpersonal pressure and coercion":
+            "🔴 Critical — language consistent with coercive control.",
+        "Media and public relations management":
+            "🟠 Notable — possible reputation management / narrative control.",
+        "General routine correspondence":
+            "⚪ Low forensic weight — appears to be standard communication.",
+        "Event planning and scheduling":
+            "🟡 Contextual — scheduling language may encode real logistics.",
+        "Identity concealment and information suppression":
+            "🔴 Critical — signals deliberate information control.",
+    }
 
     @classmethod
-    def interpret_topic(cls, words, weights) -> dict:
+    def interpret_topic(cls, words, weights=None) -> dict:
         """
-        Given LDA topic words + weights, return:
+        Given LDA topic words, return:
           - best_label: matched forensic category
           - confidence: score 0–100
-          - description: plain-English explanation
+          - description: plain-English explanation (plain text)
           - forensic_significance: brief forensic note
         """
-        pipe = cls._get_pipeline()
-        if pipe is None or not words:
+        if not words:
             return cls._fallback_interpretation(words)
-
-        # Build a natural-language description of the topic for classification
-        top_words = ", ".join(words[:6])
-        text = f"An email cluster whose most distinctive words are: {top_words}."
-
+        text = f"An email cluster whose most distinctive words are: {', '.join(words[:6])}."
         try:
-            result = pipe(text, candidate_labels=cls.FORENSIC_TOPIC_LABELS, multi_label=False)  # type: ignore
-            best_label = result["labels"][0]
-            confidence = round(result["scores"][0] * 100, 1)
-
-            description = cls._build_description(best_label, words, confidence)
-            significance = cls._forensic_note(best_label)
-
-            return {
-                "best_label": best_label,
-                "confidence": confidence,
-                "description": description,
-                "forensic_significance": significance,
-                "ai_powered": True,
-            }
+            result = _zero_shot([text], cls.FORENSIC_TOPIC_LABELS)[0]
         except Exception:
             return cls._fallback_interpretation(words)
+
+        best_label = result["labels"][0]
+        confidence = round(result["scores"][0] * 100, 1)
+        return {
+            "best_label": best_label,
+            "confidence": confidence,
+            "description": cls._build_description(best_label, words, confidence),
+            "forensic_significance": cls._forensic_note(best_label),
+            "ai_powered": True,
+        }
 
     @classmethod
     def _build_description(cls, label: str, words, confidence: float) -> str:
         top = ", ".join(f'"{w}"' for w in words[:4])
         conf_text = "strongly" if confidence > 70 else "moderately" if confidence > 45 else "tentatively"
         return (
-            f"This topic cluster {conf_text} matches the pattern of "
-            f"<strong>{label}</strong>. "
-            f"Key signal words include {top}. "
-            f"AI confidence: {confidence}%."
+            f"This topic cluster {conf_text} matches the pattern of {label}. "
+            f"Key signal words include {top}. AI confidence: {confidence}%."
         )
 
     @classmethod
     def _forensic_note(cls, label: str) -> str:
-        notes = {
-            "Logistical coordination and travel planning":
-                "🚨 High forensic relevance — coordinates movement of people/assets.",
-            "Social grooming and relationship management":
-                "🔴 Critical — language patterns consistent with grooming behaviour.",
-            "Financial transactions and payments":
-                "🔶 Significant — may indicate payment for services rendered covertly.",
-            "Coded food/service euphemisms for illicit activity":
-                "🟡 Cipher alert — food/service language as coded substitution.",
-            "Legal and administrative communication":
-                "🔵 Monitor — may contain suppression or legal-cover strategies.",
-            "Interpersonal pressure and coercion":
-                "🔴 Critical — language consistent with coercive control.",
-            "Media and public relations management":
-                "🟠 Notable — possible reputation management / narrative control.",
-            "General routine correspondence":
-                "⚪ Low forensic weight — appears to be standard communication.",
-            "Event planning and scheduling":
-                "🟡 Contextual — scheduling language may encode real logistics.",
-            "Identity concealment and information suppression":
-                "🔴 Critical — signals deliberate information control.",
-        }
-        return notes.get(label, "ℹ️ Review manually for contextual significance.")
+        return cls._NOTES.get(label, "ℹ️ Review manually for contextual significance.")
 
     @classmethod
     def _fallback_interpretation(cls, words) -> dict:
         """Rule-based fallback when transformer is unavailable."""
-        food_signals    = {'food','pizza','chicken','dinner','lunch','menu','cake'}
-        logistic_signals = {'schedule','transport','arrange','book','travel','flight'}
-        coerce_signals  = {'must','need','expect','required','demand','force'}
+        food_signals     = {'food', 'pizza', 'chicken', 'dinner', 'lunch', 'menu', 'cake', 'jerky', 'pasta'}
+        logistic_signals = {'schedule', 'transport', 'arrange', 'book', 'travel', 'flight', 'trip', 'island'}
+        coerce_signals   = {'must', 'need', 'expect', 'required', 'demand', 'force'}
+        money_signals    = {'payment', 'paid', 'pay', 'money', 'wire', 'invoice', 'bank', 'account'}
 
-        top = set(words[:6])
+        top = set(words[:8])
         if top & food_signals:
             label = "Coded food/service euphemisms for illicit activity"
         elif top & logistic_signals:
             label = "Logistical coordination and travel planning"
+        elif top & money_signals:
+            label = "Financial transactions and payments"
         elif top & coerce_signals:
             label = "Interpersonal pressure and coercion"
         else:
@@ -375,7 +538,8 @@ class AITopicInterpreter:
 class CorpusProcessor:
     """Base class: loads & caches the corpus, provides shared utilities."""
     _clean_cache = None
-    _annotated_cache = None
+    _annotated_cache: Dict[bool, list] = {}
+    _id_index: Optional[Dict[str, dict]] = None
 
     # ── Loading ──────────────────────────────────────────────────────────────
     @classmethod
@@ -386,58 +550,52 @@ class CorpusProcessor:
         return cls._clean_cache
 
     @classmethod
-    def load_annotated(cls):
-        if cls._annotated_cache is None:
+    def load_annotated(cls, include_pos: bool = False):
+        """
+        Load the annotated corpus. The per-token `pos_tagged` field makes up
+        most of the 15 MB file and nothing in the dashboard reads it, so it is
+        dropped unless include_pos=True.
+        """
+        if include_pos not in cls._annotated_cache:
             with open(_ANNOTATED_PATH, "r", encoding="utf-8") as f:
-                cls._annotated_cache = json.load(f)
-        return cls._annotated_cache
+                data = json.load(f)
+            if not include_pos:
+                data = [{k: v for k, v in e.items() if k != "pos_tagged"} for e in data]
+            cls._annotated_cache[include_pos] = data
+        return cls._annotated_cache[include_pos]
 
     @classmethod
     def get_email_by_id(cls, email_id: str):
-        """Look up a full email record by its ID from either corpus."""
-        corpus = cls.load_clean()
-        for e in corpus:
-            if e.get("id") == email_id:
-                return e
-        # Also check annotated
-        try:
-            ann = cls.load_annotated()
-            for e in ann:
-                if e.get("id") == email_id:
-                    return e
-        except Exception:
-            pass
-        return None
+        """O(1) lookup of a full email record by its ID."""
+        if cls._id_index is None:
+            cls._id_index = {e.get("id"): e for e in cls.load_clean()}
+        return cls._id_index.get(email_id)
 
-    # ── Functional querying ──────────────────────────────────────────────────
+    # ── Querying ─────────────────────────────────────────────────────────────
     @staticmethod
-    def query_by_keyword(corpus, keyword: str) -> List[Dict[str, Any]]:
-        kw = keyword.lower()
-        return list(filter(
-            lambda e: kw in e.get("body", "").lower()
-                      or kw in e.get("subject", "").lower(),
-            corpus
-        ))
+    def query_by_keyword(corpus, keyword: str, whole_word: bool = True) -> List[Dict[str, Any]]:
+        pat = keyword_pattern(keyword, whole_word)
+        return [e for e in corpus
+                if pat.search(e.get("body", "")) or pat.search(e.get("subject", ""))]
 
     @staticmethod
-    def extract_sentences_with_keyword(emails, keyword: str) -> List[Dict[str, Any]]:
-        kw = keyword.lower()
+    def extract_sentences_with_keyword(emails, keyword: str,
+                                       whole_word: bool = True) -> List[Dict[str, Any]]:
+        pat = keyword_pattern(keyword, whole_word)
         result = []
         for e in emails:
-            body = e.get("body", "")
-            sentences = re.split(r'(?<=[.!?])\s+', body)
-            for s in sentences:
-                if kw in s.lower():
+            for s in re.split(r'(?<=[.!?])\s+', e.get("body", "")):
+                if pat.search(s):
                     result.append({
-                        "id": e["id"], "sender": e["sender"],
-                        "subject": e["subject"], "sentence": s.strip()
+                        "id": e["id"], "sender": e.get("sender", ""),
+                        "subject": e.get("subject", ""), "sentence": s.strip(),
                     })
         return result
 
     @staticmethod
     def clean_text(text: str) -> str:
         text = re.sub(r'<[^>]+>', ' ', text)
-        text = re.sub(r'[\u2588]+', '[REDACTED]', text)
+        text = re.sub(r'[█]+', '[REDACTED]', text)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
@@ -457,196 +615,230 @@ class CorpusProcessor:
 # ─────────────────────────────────────────────────────────────────────────────
 class SyntacticXRay(CorpusProcessor):
     """Dependency-parse sentences containing the target keyword."""
-    def __init__(self):
-        self._nlp = None
 
     def _get_nlp(self):
-        if self._nlp is None:
-            if not _SPACY_AVAILABLE:
-                raise RuntimeError(
-                    "spaCy is not installed. Run: pip install spacy && "
-                    "python -m spacy download en_core_web_sm"
-                )
-            import spacy  # type: ignore
-            self._nlp = spacy.load("en_core_web_sm")
-        return self._nlp
+        return get_spacy_nlp()
 
-    def analyse(self, keyword: str, max_sentences: int = 30, corpus=None) -> dict:
-        if corpus is None: corpus = self.load_clean()
-        hits       = self.query_by_keyword(corpus, keyword)
-        sentences  = self.extract_sentences_with_keyword(hits, keyword)[:max_sentences]  # type: ignore
+    @staticmethod
+    def _root_action(root) -> str:
+        """Root lemma, including a phrasal particle when present ("pick up")."""
+        prt = next((c for c in root.children if c.dep_ == "prt"), None)
+        return f"{root.lemma_.lower()} {prt.text.lower()}" if prt is not None else root.lemma_.lower()
+
+    def analyse(self, keyword: str, max_sentences: int = 30, corpus=None,
+                whole_word: bool = True) -> dict:
+        if corpus is None:
+            corpus = self.load_clean()
+        hits      = self.query_by_keyword(corpus, keyword, whole_word)
+        sentences = self.extract_sentences_with_keyword(hits, keyword, whole_word)[:max_sentences]
+        pat       = keyword_pattern(keyword, whole_word)
 
         results = []
-        root_verbs: TypingCounter[str] = Counter()
-        modifiers: TypingCounter[str] = Counter()
-        hedge_count: int = 0
-        logistic_count: int = 0
+        root_verbs: Counter = Counter()
+        modifiers: Counter = Counter()
+        hedge_count = 0
+        logistic_count = 0
 
-        nlp = self._get_nlp()
-        texts = [item["sentence"] for item in sentences]
-        docs = list(nlp.pipe(texts, batch_size=50))
+        nlp  = self._get_nlp()
+        docs = nlp.pipe([item["sentence"] for item in sentences], batch_size=50)
 
         for item, doc in zip(sentences, docs):
-
-            kw_tokens = [t for t in doc if keyword.lower() in t.text.lower()]
-            if not kw_tokens:
+            # Keyword tokens = tokens overlapping a keyword match (handles
+            # multi-word keywords and inflections such as "models").
+            spans = [(m.start(), m.end()) for m in pat.finditer(doc.text)]
+            kw_idx = {t.i for t in doc
+                      if any(t.idx < end and t.idx + len(t.text) > start for start, end in spans)}
+            if not kw_idx:
                 continue
 
             root = next((t for t in doc if t.dep_ == "ROOT"), None)
-            if root:
-                root_verbs.update([root.lemma_])
-                if root.lemma_.lower() in LOGISTIC_VERBS:
-                    logistic_count += 1  # type: ignore
+            is_logistic = False
+            if root is not None:
+                action = self._root_action(root)
+                root_verbs[action] += 1
+                is_logistic = action in LOGISTIC_VERBS or root.lemma_.lower() in LOGISTIC_VERBS
+                logistic_count += is_logistic
 
-            for kw_tok in kw_tokens:
-                for child in kw_tok.children:
-                    modifiers.update([child.text.lower()])
+            for i in kw_idx:
+                for child in doc[i].children:
+                    if child.i not in kw_idx and child.text.strip() and not (child.is_punct or child.is_stop):
+                        modifiers[child.text.lower()] += 1
 
-            lower_sent = item["sentence"].lower()  # type: ignore
-            if any(h in lower_sent for h in HEDGE_WORDS):
-                hedge_count += 1  # type: ignore
+            hedges = find_hedges(item["sentence"])
+            hedge_count += bool(hedges)
 
-            edges = [
-                {"from": t.head.text, "to": t.text, "dep": t.dep_}
-                for t in doc if t.dep_ != "punct"
-            ]
-            tokens_info = [
-                {
-                    "text": t.text, "pos": t.pos_, "dep": t.dep_,
-                    "head": t.head.text,
-                    "is_keyword": keyword.lower() in t.text.lower()
-                }
-                for t in doc
-            ]
-            import pandas as pd  # type: ignore
-            edges_df = pd.DataFrame([
-                {"from": e["from"], "to": e["to"], "dep": e["dep"]} for e in edges  # type: ignore
-            ])
-            
-            item_data = {
-                "sentence":  item["sentence"],  # type: ignore
-                "email_id":  item["id"],        # type: ignore
-                "sender":    item["sender"],    # type: ignore
-                "subject":   item["subject"],   # type: ignore
-                "edges":     edges,
-                "tokens":    tokens_info,
-                "root":      getattr(root, "text", "") if root else "",
-            }
-            results.append(item_data)  # type: ignore
+            results.append({
+                "sentence": item["sentence"],
+                "email_id": item["id"],
+                "sender":   item["sender"],
+                "subject":  item["subject"],
+                "edges": [
+                    {"from": t.head.text, "to": t.text, "dep": t.dep_}
+                    for t in doc if t.dep_ != "punct"
+                ],
+                "tokens": [
+                    {"text": t.text, "pos": t.pos_, "dep": t.dep_,
+                     "head": t.head.text, "is_keyword": t.i in kw_idx}
+                    for t in doc
+                ],
+                "root":        root.text if root is not None else "",
+                "hedges":      hedges,
+                "is_logistic": is_logistic,
+            })
 
-        total_hits   = len(hits)
-        hedge_pct    = round(float(hedge_count    / max(len(sentences), 1) * 100), 1)  # type: ignore
-        logistic_pct = round(float(logistic_count / max(len(sentences), 1) * 100), 1)  # type: ignore
-
+        parsed = max(len(results), 1)
         return {
-            "keyword":                  keyword,
-            "total_emails_with_keyword": total_hits,
-            "sentences_analysed":       len(sentences),
-            "hedge_percentage":         hedge_pct,
-            "logistic_verb_percentage": logistic_pct,
-            "top_root_verbs":           root_verbs.most_common(10),  # type: ignore
-            "top_modifiers":            modifiers.most_common(10),  # type: ignore
-            "sentence_details":         results,
+            "keyword":                   keyword,
+            "total_emails_with_keyword": len(hits),
+            "sentences_analysed":        len(results),
+            "hedge_percentage":          round(hedge_count / parsed * 100, 1),
+            "logistic_verb_percentage":  round(logistic_count / parsed * 100, 1),
+            "top_root_verbs":            root_verbs.most_common(10),
+            "top_modifiers":             modifiers.most_common(10),
+            "sentence_details":          results,
         }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE 2 — ENTITY SPIDERWEB  (spaCy NER + NetworkX)
 # ─────────────────────────────────────────────────────────────────────────────
+_ENTITY_LABELS = {"PERSON": "PERSON", "ORG": "ORGANIZATION", "GPE": "GPE",
+                  "FAC": "FACILITY", "LOC": "LOCATION"}
+
+
+def normalize_entity(name: str) -> str:
+    """Tidy an entity mention so variants collapse onto one node."""
+    name = re.sub(r"\s+", " ", name).strip(" \t\"'`.,;:()[]{}<>-–—")
+    name = re.sub(r"(?:'s|’s)$", "", name)
+    name = re.sub(r"^(?:the|The)\s+", "", name)
+    return name.strip()
+
+
+# Greetings / sign-offs that spaCy regularly mistakes for names.
+_NON_ENTITIES = {
+    "warmly", "thanks", "thank you", "regards", "best", "best regards", "cheers",
+    "sincerely", "love", "xoxo", "hi", "hello", "dear", "sent", "iphone", "ipad",
+    "fwd", "re", "subject", "cc", "bcc", "tel", "fax", "mobile", "email",
+}
+
+
+def _is_valid_entity(name: str) -> bool:
+    return (len(name) > 2
+            and any(c.isalpha() for c in name)
+            and name.lower() not in _NON_ENTITIES
+            and "redacted" not in name.lower()
+            and not re.fullmatch(r"EFTA\w*", name))
+
+
 class EntitySpiderweb(CorpusProcessor):
     """Named-entity co-occurrence graph centred on a keyword."""
-    def __init__(self):
-        self._nlp = None
 
     def _get_nlp(self):
-        if self._nlp is None:
-            if not _SPACY_AVAILABLE:
-                raise RuntimeError(
-                    "spaCy is not installed. Run: pip install spacy && "
-                    "python -m spacy download en_core_web_sm"
-                )
-            import spacy  # type: ignore
-            self._nlp = spacy.load("en_core_web_sm")
-        return self._nlp
+        return get_spacy_nlp()
 
-    def analyse(self, keyword: str, max_emails: int = 150, corpus=None) -> dict:
+    def analyse(self, keyword: str, max_emails: int = 150, corpus=None,
+                whole_word: bool = True, max_nodes: int = 60,
+                max_edges: int = 100) -> dict:
         """
-        max_emails increased to 150 by default; caller can push higher via slider.
-        Now also returns email_entity_map so the UI can open email overlays
-        when a node is clicked.
+        Build the co-occurrence network. Only the `max_nodes` best-connected
+        entities are returned and every edge references a returned node.
+        `node_email_map` lets the UI list the emails behind a clicked node.
         """
-        if corpus is None: corpus = self.load_clean()
-        hits   = self.query_by_keyword(corpus, keyword)[:max_emails]  # type: ignore
+        if corpus is None:
+            corpus = self.load_clean()
+        hits = self.query_by_keyword(corpus, keyword, whole_word)[:max_emails]
 
-        edge_weights: TypingCounter[tuple] = Counter()
-        node_types = {}
-        # node_id → list of email dicts that contain this entity
-        node_email_map = defaultdict(list)
+        edge_weights: Counter = Counter()
+        type_votes: Dict[str, Counter] = defaultdict(Counter)
+        mentions: Counter = Counter()
+        node_email_ids: Dict[str, List[str]] = defaultdict(list)
         email_entity_map = []
 
-        nlp = self._get_nlp()
-        texts = [email.get("body", "")[:2000] for email in hits]
-        docs = list(nlp.pipe(texts, batch_size=50))
+        nlp  = self._get_nlp()
+        docs = nlp.pipe((email.get("body", "")[:2000] for email in hits), batch_size=50)
 
         for email, doc in zip(hits, docs):
-            entities = []
+            names = set()
             for ent in doc.ents:
-                if ent.label_ in ("PERSON", "ORG", "GPE", "FAC", "LOC"):
-                    label = ent.label_
-                    if label == "ORG": label = "ORGANIZATION"
-                    if label == "LOC": label = "LOCATION"
-                    if label == "FAC": label = "FACILITY"
-                    entities.append({"name": ent.text.strip(), "type": label})
+                label = _ENTITY_LABELS.get(ent.label_)
+                if not label:
+                    continue
+                name = normalize_entity(ent.text)
+                if not _is_valid_entity(name):
+                    continue
+                names.add(name)
+                type_votes[name][label] += 1
 
-            names = list({e["name"] for e in entities if len(e["name"]) > 2})
+            for name in names:
+                mentions[name] += 1
+                node_email_ids[name].append(email["id"])
 
-            for e in entities:
-                node_types[e["name"]] = e["type"]
-                node_email_map[e["name"]].append({  # type: ignore
-                    "id":      email["id"],
-                    "sender":  email.get("sender", ""),
-                    "subject": email.get("subject", ""),
-                    "body":    email.get("body", ""),
-                })
+            ordered = sorted(names)
+            for i in range(len(ordered)):
+                for j in range(i + 1, len(ordered)):
+                    edge_weights[(ordered[i], ordered[j])] += 1
 
-            for i in range(len(names)):
-                for j in range(i + 1, len(names)):
-                    pair = tuple(sorted([names[i], names[j]]))
-                    edge_weights[pair] += 1  # type: ignore
+            if ordered:
+                email_entity_map.append({"id": email["id"], "entities": ordered})
 
-            if names:
-                email_entity_map.append({"id": email["id"], "entities": names})
+        # Weighted degree over the full graph decides which nodes are kept.
+        strength: Counter = Counter()
+        for (a, b), w in edge_weights.items():
+            strength[a] += w
+            strength[b] += w
+        ranked = sorted(mentions, key=lambda n: (strength[n], mentions[n], n), reverse=True)
+        keep = set(ranked[:max_nodes])
 
-        nodes = [{"id": name, "type": ntype} for name, ntype in node_types.items()]
         edges = [
             {"source": a, "target": b, "weight": w}
-            for (a, b), w in edge_weights.most_common(80)  # type: ignore
+            for (a, b), w in edge_weights.most_common()
+            if a in keep and b in keep
+        ][:max_edges]
+
+        betweenness: Dict[str, float] = {}
+        if _NX_AVAILABLE and edges:
+            g = nx.Graph()
+            for e in edges:
+                # Strong ties = short distances for path-based centrality.
+                g.add_edge(e["source"], e["target"], weight=e["weight"], distance=1.0 / e["weight"])
+            betweenness = nx.betweenness_centrality(g, weight="distance", normalized=True)
+
+        nodes = [
+            {
+                "id":          name,
+                "type":        type_votes[name].most_common(1)[0][0],
+                "mentions":    mentions[name],
+                "degree":      strength[name],
+                "betweenness": round(betweenness.get(name, 0.0), 4),
+            }
+            for name in ranked[:max_nodes]
         ]
 
-        # Deduplicate node_email_map entries by email id
-        for node_id in list(node_email_map.keys()):  # type: ignore
-            seen = set()
-            unique = []
-            for em in node_email_map[node_id]:  # type: ignore
-                if em["id"] not in seen:
-                    seen.add(em["id"])
-                    unique.append(em)
-            node_email_map[node_id] = unique  # type: ignore
+        by_id = {e["id"]: e for e in hits}
+        node_email_map = {
+            name: [
+                {k: by_id[eid].get(k, "") for k in ("id", "sender", "subject", "body")}
+                for eid in node_email_ids[name]
+            ]
+            for name in keep
+        }
+
+        node_strength = Counter()
+        for e in edges:
+            node_strength[e["source"]] += e["weight"]
+            node_strength[e["target"]] += e["weight"]
 
         return {
             "keyword":          keyword,
             "total_emails":     len(hits),
+            "total_entities":   len(mentions),
             "nodes":            nodes,
             "edges":            edges,
-            "node_email_map":   dict(node_email_map),   # NEW: for click overlays
+            "node_email_map":   node_email_map,
             "email_entity_map": email_entity_map,
-            "top_entities":     Counter({
-                n["id"]: sum(
-                    e["weight"]
-                    for e in edges
-                    if e["source"] == n["id"] or e["target"] == n["id"]
-                )
-                for n in nodes
-            }).most_common(15),
+            "top_entities":     node_strength.most_common(15),
+            "top_brokers":      sorted(
+                ((n, b) for n, b in betweenness.items() if b > 0),
+                key=lambda x: x[1], reverse=True)[:10],
         }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -654,45 +846,55 @@ class EntitySpiderweb(CorpusProcessor):
 # ─────────────────────────────────────────────────────────────────────────────
 class ContextDecoder(CorpusProcessor):
     """
-    Unsupervised LDA topic modeling on emails filtered by keyword.
-    Now enriched with AI-powered topic descriptions via AITopicInterpreter.
+    Unsupervised LDA topic modeling on emails filtered by keyword, optionally
+    enriched with topic descriptions via AITopicInterpreter.
     """
-    _STOP = {
-        'the', 'a', 'an', 'is', 'it', 'in', 'on', 'at', 'to', 'for', 'of',
-        'and', 'or', 'but', 'not', 'this', 'that', 'with', 'from', 'by',
-        'be', 'as', 'are', 'was', 'were', 'have', 'has', 'had', 'will',
-        'would', 'could', 'should', 'may', 'might', 'i', 'you', 'he', 'she',
-        'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your',
-        'his', 'its', 'our', 'their', 'do', 'did', 'does', 'been', 'being',
-        'can', 'all', 'if', 'about', 'up', 'out', 'so', 'also', 'just',
-        'no', 'than', 'then', 'when', 'what', 'there', 'which', 'who',
-        'how', 'any', 'some', 'more', 'very', 'get', 'got', 'go', 'will',
-        'let', 'know', 'think', 'want', 'like', 'well', 'back', 'one',
-        'time', 'see', 'please', 'thank', 're', 'sent', 'subject', 'dear',
-        'regards', 'best', 'kind', 'hello', 'hi', 'email'
+    _STOP = set(GENSIM_STOP) | EMAIL_BOILERPLATE | {
+        'would', 'could', 'should', 'may', 'might', 'will', 'can', 'get', 'got',
+        'let', 'know', 'think', 'want', 'like', 'well', 'one', 'time', 'see',
+        'just', 'also', 'good', 'great', 'need', 'today', 'tomorrow', 'yes',
+        'okay', 'sure', 'going', 'really', 'make', 'said', 'new',
     }
 
-    def _tokenize(self, text: str) -> list:
-        tokens = re.findall(r'\b[a-z]{3,}\b', text.lower())
-        return [t for t in tokens if t not in self._STOP]
+    def _tokenize(self, text: str, extra_stop: Iterable[str] = ()) -> list:
+        stop = self._STOP | set(extra_stop)
+        return [t for t in tokenize_words(text)
+                if len(t) >= 3 and "'" not in t and t not in stop]
+
+    @staticmethod
+    def _keyword_stopwords(keyword: str) -> set:
+        """The keyword itself and its inflections would dominate every topic."""
+        stop = set()
+        for w in tokenize_words(keyword):
+            stop |= {w, w + "s", w + "es", w + "d", w + "ed", w + "ing", w + "er", w + "ers"}
+        return stop
 
     def analyse(self, keyword: str, num_topics: int = 5,
-                interpret_topics: bool = True, corpus=None) -> dict:
+                interpret_topics: bool = True, corpus=None,
+                whole_word: bool = True) -> dict:
         if not _GENSIM_AVAILABLE:
             raise RuntimeError("Gensim is not installed. Run: pip install gensim")
 
-        if corpus is None: corpus = self.load_clean()
-        hits   = self.query_by_keyword(corpus, keyword)
+        if corpus is None:
+            corpus = self.load_clean()
+        hits = self.query_by_keyword(corpus, keyword, whole_word)
 
         if len(hits) < 5:
             return {"error": f"Too few emails ({len(hits)}) for topic modeling. Need at least 5."}
 
-        docs       = [self._tokenize(e.get("body", "")) for e in hits]
-        docs       = [d for d in docs if len(d) >= 5]
+        kw_stop = self._keyword_stopwords(keyword)
+        # Keep each email paired with its tokens so dominant topics map back
+        # to the right email ID after short documents are filtered out.
+        pairs = [(e, self._tokenize(e.get("body", ""), kw_stop)) for e in hits]
+        pairs = [(e, toks) for e, toks in pairs if len(toks) >= 5]
+        if len(pairs) < 5:
+            return {"error": f"Too few substantive emails ({len(pairs)}) for topic modeling. Need at least 5."}
 
-        dictionary = corpora.Dictionary(docs)
-        dictionary.filter_extremes(no_below=2, no_above=0.9)
-        bow_corpus = [dictionary.doc2bow(d) for d in docs]
+        dictionary = corpora.Dictionary(toks for _, toks in pairs)
+        dictionary.filter_extremes(no_below=2, no_above=0.6)
+        if len(dictionary) < num_topics:
+            return {"error": "Vocabulary too small after filtering for topic modeling. Try a broader keyword."}
+        bow_corpus = [dictionary.doc2bow(toks) for _, toks in pairs]
 
         lda = LdaModel(
             corpus=bow_corpus,
@@ -704,47 +906,32 @@ class ContextDecoder(CorpusProcessor):
         )
 
         topics = []
-        for idx, topic in lda.print_topics(num_topics, num_words=8):
-            words   = re.findall(r'"([^"]+)"', topic)
-            weights = list(map(float, re.findall(r'(\d+\.\d+)\*', topic)))
+        for idx in range(num_topics):
+            terms = lda.show_topic(idx, topn=8)
+            words = [w for w, _ in terms]
+            topics.append({
+                "id":             idx,
+                "label":          f"Topic {idx + 1}",
+                "words":          words,
+                "weights":        [round(float(p), 4) for _, p in terms],
+                "interpretation": (AITopicInterpreter.interpret_topic(words)
+                                   if interpret_topics else None),
+            })
 
-            topic_dict = {
-                "id":     idx,
-                "label":  f"Topic {idx + 1}",
-                "words":  words,
-                "weights": weights,
-                "interpretation": None,
-            }
-
-            # AI interpretation
-            if interpret_topics:
-                try:
-                    topic_dict["interpretation"] = AITopicInterpreter.interpret_topic(
-                        words, weights
-                    )
-                    interp = topic_dict["interpretation"]
-                    if isinstance(interp, dict) and interp.get("best_label"):  # type: ignore
-                        topic_dict["label"] = f"Topic {idx + 1}"
-                except Exception:
-                    pass
-
-            topics.append(topic_dict)
-
-        # Dominant topic per doc
         doc_topics = []
-        for i, bow in enumerate(bow_corpus):
+        for (email, _), bow in zip(pairs, bow_corpus):
             dist = lda.get_document_topics(bow)
             if dist:
-                dominant = max(dist, key=lambda x: x[1])
+                topic_id, prob = max(dist, key=lambda x: x[1])
                 doc_topics.append({
-                    "email_id":       hits[i]["id"],
-                    "dominant_topic": dominant[0],
-                    "confidence":     round(dominant[1] * 100, 1),
+                    "email_id":       email["id"],
+                    "dominant_topic": int(topic_id),
+                    "confidence":     round(float(prob) * 100, 1),
                 })
 
         return {
             "keyword":         keyword,
-            "emails_analysed": len(docs),
+            "emails_analysed": len(pairs),
             "num_topics":      num_topics,
             "topics":          topics,
             "doc_topics":      doc_topics,
@@ -754,58 +941,74 @@ class ContextDecoder(CorpusProcessor):
 # MODULE 4 — DIACHRONIC TIMELINE  (Pandas time-series)
 # ─────────────────────────────────────────────────────────────────────────────
 class DiachronicTimeline(CorpusProcessor):
-    """Track syntactic hedging / flagged-term density over time (by email index)."""
-    def analyse(self, keyword: str, annotated_corpus=None) -> dict:
+    """
+    Track syntactic hedging / logistic-verb / flagged-term density over time.
+
+    order="date"   → emails with a recoverable date (see estimate_email_date),
+                     sorted chronologically. Falls back to corpus order when
+                     fewer than `min_dated` emails carry a date.
+    order="corpus" → every matching email in the clean corpus's order (the
+                     annotated file itself is sorted by flag count, which made
+                     the old index-based chart a ranking, not a timeline).
+    """
+
+    def analyse(self, keyword: str, annotated_corpus=None, whole_word: bool = True,
+                window: int = 10, order: str = "date", min_dated: int = 5) -> dict:
         if not _PD_AVAILABLE:
             raise RuntimeError("Pandas is not installed. Run: pip install pandas")
 
         if annotated_corpus is None:
             annotated_corpus = self.load_annotated()
-        
-        kw        = keyword.lower()
-        hits      = [e for e in annotated_corpus if kw in e.get("body", "").lower()]
+        hits = self.query_by_keyword(annotated_corpus, keyword, whole_word)
 
         if not hits:
             return {"error": f"No emails found for keyword '{keyword}'."}
 
+        rank = {e.get("id"): i for i, e in enumerate(self.load_clean())}
         rows = []
-        for i, e in enumerate(hits):
-            body    = e.get("body", "")
-            tokens  = body.lower().split()
-            total   = max(len(tokens), 1)
-
-            hedge_count    = sum(1 for t in tokens if t in HEDGE_WORDS)
-            logistic_count = sum(1 for t in tokens if t in LOGISTIC_VERBS)
-            flag_count     = e.get("flag_count", 0)
-
+        for e in hits:
+            body  = e.get("body", "")
+            total = max(len(tokenize_words(body)), 1)
             rows.append({
-                "index":            i,
                 "email_id":         e["id"],
+                "date":             estimate_email_date(body),
+                "corpus_rank":      rank.get(e["id"], len(rank)),
                 "sender":           e.get("sender", ""),
                 "subject":          e.get("subject", ""),
-                "body":             e.get("body", ""),      # full body for overlay
-                "hedge_density":    round(hedge_count    / total * 100, 3),  # type: ignore
-                "logistic_density": round(logistic_count / total * 100, 3),  # type: ignore
-                "flag_count":       flag_count,
-                "body_length":      len(tokens),
+                "hedge_density":    round(count_hedges(body) / total * 100, 3),
+                "logistic_density": round(count_logistic_verbs(body) / total * 100, 3),
+                "flag_count":       e.get("flag_count", 0),
+                "body_length":      total,
             })
 
         df = pd.DataFrame(rows)
-        df["hedge_rolling"]    = df["hedge_density"].rolling(10, min_periods=1).mean().round(3)  # type: ignore
-        df["logistic_rolling"] = df["logistic_density"].rolling(10, min_periods=1).mean().round(3)  # type: ignore
+        dated_count = int(df["date"].notna().sum())
+        if order == "date" and dated_count >= min_dated:
+            df = df[df["date"].notna()].sort_values(["date", "corpus_rank"])
+        else:
+            order = "corpus"
+            df = df.sort_values("corpus_rank")
+        df = df.reset_index(drop=True)
+        df.insert(0, "index", range(len(df)))
+        df["date"] = pd.to_datetime(df["date"])
 
-        # Exclude 'body' from the serialised output to keep payload small;
-        # it's accessible via get_email_by_id() for overlays.
-        timeline_records = df.drop(columns=["body"]).to_dict(orient="records")
+        df["hedge_rolling"]    = df["hedge_density"].rolling(window, min_periods=1).mean().round(3)
+        df["logistic_rolling"] = df["logistic_density"].rolling(window, min_periods=1).mean().round(3)
 
         return {
-            "keyword":               keyword,
-            "total_emails":          len(rows),
-            "timeline":              timeline_records,
-            "peak_hedge_email":      df.loc[df["hedge_density"].idxmax()].to_dict(),
-            "peak_logistic_email":   df.loc[df["logistic_density"].idxmax()].to_dict(),
-            "avg_hedge_density":     round(df["hedge_density"].mean(), 3),
-            "avg_logistic_density":  round(df["logistic_density"].mean(), 3),
+            "keyword":              keyword,
+            "order":                order,
+            "total_emails":         len(df),
+            "matched_emails":       len(rows),
+            "dated_emails":         dated_count,
+            "date_range":           ((df["date"].min().date().isoformat(), df["date"].max().date().isoformat())
+                                     if order == "date" else None),
+            "window":               window,
+            "timeline":             df.to_dict(orient="records"),
+            "peak_hedge_email":     df.loc[df["hedge_density"].idxmax()].to_dict(),
+            "peak_logistic_email":  df.loc[df["logistic_density"].idxmax()].to_dict(),
+            "avg_hedge_density":    round(float(df["hedge_density"].mean()), 3),
+            "avg_logistic_density": round(float(df["logistic_density"].mean()), 3),
         }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -821,61 +1024,68 @@ FORENSIC_LABELS = [
     "Coded Language Usage",
 ]
 
+# Labels that describe benign intent — a high score on these is not a threat.
+BENIGN_LABELS = {"Routine Communication"}
+
+
 class ThreatAssessor(CorpusProcessor):
     """Zero-shot intent classification using HuggingFace Transformers."""
-    _pipeline = None
 
     @classmethod
     def get_pipeline(cls):
-        if cls._pipeline is None:
-            try:
-                from transformers import pipeline  # type: ignore
-                cls._pipeline = pipeline(
-                    "zero-shot-classification",
-                    model="cross-encoder/nli-MiniLM2-L6-H768",
-                    device=-1,
-                )
-            except ImportError:
-                raise RuntimeError(
-                    "transformers or torch not installed. "
-                    "Run: pip install transformers torch"
-                )
-            except Exception as e:
-                raise RuntimeError(f"Error initializing NLP pipeline: {str(e)}")
-        return cls._pipeline
+        return get_zero_shot_pipeline()
 
-    def assess_email(self, email_body: str, labels = None) -> dict:
-        if labels is None:
-            labels = FORENSIC_LABELS
+    @staticmethod
+    def _validate_labels(labels) -> List[str]:
+        labels = [l.strip() for l in (labels or FORENSIC_LABELS) if l and l.strip()]
+        labels = list(dict.fromkeys(labels))  # de-duplicate, keep order
+        if len(labels) < 2:
+            raise ValueError("Provide at least two distinct labels to compare.")
+        return labels
 
-        pipe    = self.get_pipeline()
-        snippet = email_body[:512]  # type: ignore
-        result  = pipe(snippet, candidate_labels=labels, multi_label=False)
-
-        scores = [
-            {"label": l, "score": round(s * 100, 1)}
-            for l, s in zip(result["labels"], result["scores"])
-        ]
-        scores.sort(key=lambda x: x["score"], reverse=True)
-
+    @staticmethod
+    def _format(result: dict) -> dict:
+        scores = sorted(
+            ({"label": l, "score": round(s * 100, 1)}
+             for l, s in zip(result["labels"], result["scores"])),
+            key=lambda x: x["score"], reverse=True,
+        )
         return {
             "top_label":  scores[0]["label"],
             "top_score":  scores[0]["score"],
             "all_scores": scores,
         }
 
-    def search_and_assess(self, keyword: str, top_n: int = 10, corpus=None) -> list:
-        if corpus is None: corpus = self.load_clean()
-        hits       = self.query_by_keyword(corpus, keyword)[:top_n]  # type: ignore
-        results = []
-        for e in hits:
-            assessment = self.assess_email(e["body"])
-            results.append({
-                "email_id":     e["id"],
-                "sender":       e["sender"],
-                "subject":      e["subject"],
-                "body_snippet": e["body"][:300],
-                "body":         e["body"],
-                **assessment,
-            })
+    def assess_many(self, bodies: Sequence[str], labels=None, batch_size: int = 8,
+                    progress: Optional[Callable[[int, int], None]] = None) -> List[dict]:
+        """Classify many emails with batched inference; `progress(done, total)` is optional."""
+        labels = self._validate_labels(labels)
+        snippets = [self.clean_text(b)[:512] for b in bodies]
+        results: List[dict] = []
+        for start in range(0, len(snippets), batch_size):
+            chunk = snippets[start:start + batch_size]
+            results.extend(self._format(r) for r in _zero_shot(chunk, labels, batch_size))
+            if progress:
+                progress(len(results), len(snippets))
         return results
+
+    def assess_email(self, email_body: str, labels=None) -> dict:
+        return self.assess_many([email_body], labels)[0]
+
+    def search_and_assess(self, keyword: str, top_n: int = 10, corpus=None,
+                          whole_word: bool = True, labels=None) -> list:
+        if corpus is None:
+            corpus = self.load_clean()
+        hits = self.query_by_keyword(corpus, keyword, whole_word)[:top_n]
+        assessments = self.assess_many([e.get("body", "") for e in hits], labels)
+        return [
+            {
+                "email_id":     e["id"],
+                "sender":       e.get("sender", ""),
+                "subject":      e.get("subject", ""),
+                "body_snippet": e.get("body", "")[:300],
+                "body":         e.get("body", ""),
+                **a,
+            }
+            for e, a in zip(hits, assessments)
+        ]

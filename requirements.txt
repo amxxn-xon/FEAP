@@ -2,15 +2,15 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 # ── Core Framework ────────────────────────────────────────────────────────────
-streamlit>=1.35.0
+streamlit>=1.50.0
 
 # ── Data & NLP ────────────────────────────────────────────────────────────────
 pandas>=2.0.0
 numpy>=1.24.0
-nltk>=3.8.1
 
-# ── Dependency Parsing (Module 1 - X-Ray) ─────────────────────────────────────
-spacy>=3.7.0
+# ── Dependency Parsing & NER (Modules 1 & 2) ──────────────────────────────────
+# en_core_web_sm 3.8.0 requires spaCy 3.8.x
+spacy>=3.8.0,<3.9.0
 # Automatic download for Streamlit Cloud
 en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
 
@@ -21,10 +21,11 @@ streamlit-agraph>=0.0.45
 # ── Topic Modeling (Module 3 - Context Decoder) ───────────────────────────────
 gensim>=4.3.0
 
-# ── Deep Learning / Zero-Shot (Module 5 - Threat Assessor) ────────────────────
-# Pinning specific weights and torch version for stability
+# ── Deep Learning / Zero-Shot (Module 5 - Threat Assessor, AI features) ───────
 torch
-torchvision
 transformers>=4.41.0
 protobuf>=3.20.3
 huggingface-hub>=0.23.0
+
+# ── Tests (optional) ──────────────────────────────────────────────────────────
+pytest>=8.0
